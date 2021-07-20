@@ -3,6 +3,7 @@ package csi
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -173,6 +174,15 @@ func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	vol.Name = volumeID
+	if usePVCName, ok := volumeParameters["usePVCName"]; ok {
+		if usePVCName == "true" {
+			if pvc, ok := volumeParameters["csi.storage.k8s.io/pvc/name"]; ok {
+				vol.Name = pvc
+			} else {
+				logrus.Warnf("volumeParameter 'usePVCName' was 'true' but parameter 'csi.storage.k8s.io/pvc/name' was not found, make sure the csi-provisioner was run with the --extra-create-metadata argument")
+			}
+		}
+	}
 	vol.Size = fmt.Sprintf("%d", reqVolSizeBytes)
 
 	logrus.Infof("CreateVolume: creating a volume by API client, name: %s, size: %s accessMode: %v", vol.Name, vol.Size, vol.AccessMode)
@@ -281,9 +291,36 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 		return nil, status.Error(codes.InvalidArgument, "volume capability missing in request")
 	}
 
-	// TODO: #1875 API returns error instead of not found, so we cannot differenciate between a retrieval failure and non existing resource
-	if _, err := cs.apiClient.Node.ById(nodeID); err != nil {
-		return nil, status.Errorf(codes.NotFound, "node %s not found", nodeID)
+	var node *longhornclient.Node
+
+	if frontend, ok := req.VolumeContext["frontend"]; ok {
+		if frontend == string(types.VolumeFrontendISCSI) {
+			nodeCollection, err := cs.apiClient.Node.List(nil)
+			if err != nil {
+				msg := fmt.Sprintf("Failed to list nodes.")
+				logrus.Warn(msg)
+				return nil, status.Error(codes.NotFound, msg)
+			}
+
+			if len(nodeCollection.Data) > 0 {
+				// Select random node from list to attach to.
+				node = &nodeCollection.Data[rand.Intn(len(nodeCollection.Data))]
+			} else {
+				msg := fmt.Sprintf("Failed to get node.")
+				logrus.Warn(msg)
+				return nil, status.Error(codes.NotFound, msg)
+			}
+		}
+	}
+
+	if node == nil {
+		myNode, err := cs.apiClient.Node.ById(req.GetNodeId())
+		if err != nil {
+			msg := fmt.Sprintf("ControllerPublishVolume: the node %s does not exist", req.GetNodeId())
+			logrus.Warn(msg)
+			return nil, status.Error(codes.NotFound, msg)
+		}
+		node = myNode
 	}
 
 	volume, err := cs.apiClient.Volume.ById(volumeID)
@@ -292,10 +329,6 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 	if volume == nil {
 		return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
-	}
-
-	if volume.Frontend != string(types.VolumeFrontendBlockDev) {
-		return nil, status.Errorf(codes.InvalidArgument, "volume %s invalid frontend type %s", volumeID, volume.Frontend)
 	}
 
 	if requiresSharedAccess(volume, volumeCapability) {
@@ -322,12 +355,12 @@ func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *cs
 			volumeID, nodeID, volume.Controllers[0].HostId)
 	}
 
-	return cs.publishVolume(volume, nodeID, func() error {
+	return cs.publishVolume(volume, node.Id, func() error {
 		checkVolumePublished := func(vol *longhornclient.Volume) bool {
-			return isVolumeAvailableOn(vol, nodeID) || isVolumeShareAvailable(vol)
+			return isVolumeAvailableOn(vol, node.Id) || isVolumeShareAvailable(vol)
 		}
-		if !cs.waitForVolumeState(volumeID, "volume published", checkVolumePublished, false, false) {
-			return status.Errorf(codes.DeadlineExceeded, "volume %s failed to attach to node %s", volumeID, nodeID)
+		if !cs.waitForVolumeState(req.GetVolumeId(), "volume published", checkVolumePublished, false, false) {
+			return status.Errorf(codes.DeadlineExceeded, "Failed to attach volume %s to node %s", req.GetVolumeId(), node.Id)
 		}
 		return nil
 	})
@@ -396,6 +429,15 @@ func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 		return &csi.ControllerUnpublishVolumeResponse{}, nil
 	}
 
+	// If volume frontend is ISCSI, then send unpublishVolume RPC request for the remote node it's attached to.
+	if volume.Frontend == string(types.VolumeFrontendISCSI) {
+		if len(volume.Controllers) > 1 {
+			logrus.Warnf("Found more than 1 controller for attached volume: %s", volume.Id)
+		}
+		logrus.Infof("ISCSI volume controllers: %d", len(volume.Controllers))
+		nodeID = volume.Controllers[0].HostId
+	}
+
 	return cs.unpublishVolume(volume, nodeID, func() error {
 		isSharedVolume := requiresSharedAccess(volume, nil) && !volume.Migratable
 		checkVolumeUnpublished := func(vol *longhornclient.Volume) bool {
@@ -403,7 +445,7 @@ func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *
 		}
 
 		if !cs.waitForVolumeState(volumeID, "volume unpublished", checkVolumeUnpublished, false, true) {
-			return status.Errorf(codes.DeadlineExceeded, "Failed to detach volume %s from node %s", volumeID, volumeID)
+			return status.Errorf(codes.DeadlineExceeded, "Failed to detach volume %s from node %s", volumeID, nodeID)
 		}
 		return nil
 	})

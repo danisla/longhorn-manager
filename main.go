@@ -7,6 +7,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 
+	iscsiLib "github.com/kubernetes-csi/csi-lib-iscsi/iscsi"
 	"github.com/longhorn/longhorn-manager/app"
 )
 
@@ -30,6 +31,7 @@ func main() {
 	a.Before = func(c *cli.Context) error {
 		if c.GlobalBool("debug") {
 			logrus.SetLevel(logrus.DebugLevel)
+			iscsiLib.EnableDebugLogging(os.Stdout)
 		}
 		if c.GlobalBool("log-json") {
 			logrus.SetFormatter(&logrus.JSONFormatter{})

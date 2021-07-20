@@ -148,6 +148,14 @@ func getVolumeOptions(volOptions map[string]string) (*longhornclient.Volume, err
 		vol.NodeSelector = strings.Split(nodeSelector, ",")
 	}
 
+	if frontend, ok := volOptions["frontend"]; ok {
+		if frontend == string(types.VolumeFrontendISCSI) || frontend == string(types.VolumeFrontendBlockDev) {
+			vol.Frontend = frontend
+		} else {
+			return nil, fmt.Errorf("Invalid value for parameter 'frontend'")
+		}
+	}
+
 	return vol, nil
 }
 

@@ -6,7 +6,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/pkg/errors"
@@ -80,8 +82,9 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Errorf(codes.InvalidArgument, "volume %s invalid controller count %v", volumeID, len(volume.Controllers))
 	}
 
-	if volume.DisableFrontend || volume.Frontend != string(types.VolumeFrontendBlockDev) {
-		return nil, status.Errorf(codes.InvalidArgument, "volume %s invalid frontend type %v is disabled %v", volumeID, volume.Frontend, volume.DisableFrontend)
+	// Check volume frontend settings
+	if volume.DisableFrontend {
+		return nil, status.Errorf(codes.InvalidArgument, "There is no block device frontend for volume %s", req.GetVolumeId())
 	}
 
 	// Check volume attachment status
@@ -112,6 +115,65 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 
 		return ns.nodePublishSharedVolume(volumeID, volume.ShareEndpoint, targetPath, mounter)
 	} else if volumeCapability.GetMount() != nil {
+		if volume.Frontend == string(types.VolumeFrontendISCSI) {
+			util := &ISCSIUtil{}
+
+			// Verify that device is not currenctly mounted somewhere else, if so, unmount it.
+			currMounts, err := util.ListMounts()
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+
+			// Search all existing mounts for matching volume.
+			mountPat := regexp.MustCompile(fmt.Sprintf("^.*/kubelet/pods/.*/volumes/kubernetes.io~csi/%s/mount$", volumeID))
+			for _, mountPath := range currMounts {
+				if mountPath == targetPath {
+					continue
+				}
+				if mountPat.MatchString(mountPath) {
+					logrus.Warnf("ISCSI volume %v already mounted at path: %s, unmounting", volumeID, mountPath)
+					diskUnmounter := getISCSIDiskUnmounterForVolume(volumeID)
+					if err := util.DetachDisk(*diskUnmounter, mountPath); err != nil {
+						return nil, status.Error(codes.Internal, err.Error())
+					}
+
+					logrus.Infof("ISCSI detach and unmount complete for volume %v at targetPath: %s", volumeID, mountPath)
+				}
+			}
+
+			logrus.Infof("Mounting ISCSI volume %v with endpoint %v to path: %v", volumeID, devicePath, targetPath)
+
+			portal, iqn, lun, err := parseISCSIEndpoint(devicePath)
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+
+			ctx := iscsiContext{
+				TargetPortal:      portal,
+				IQN:               iqn,
+				Lun:               lun,
+				Portals:           portal,
+				Secret:            "",
+				ISCSIInterface:    "default",
+				InitiatorName:     fmt.Sprintf("%s:%s", "driver.longhorn.io", ns.nodeID),
+				DiscoveryCHAPAuth: "false",
+				SessionCHAPAuth:   "false",
+			}
+
+			iscsiInfo, err := getISCSIInfo(req, ctx)
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+			diskMounter := getISCSIDiskMounter(iscsiInfo, req)
+
+			_, err = util.AttachDisk(*diskMounter)
+			if err != nil {
+				return nil, status.Error(codes.Internal, err.Error())
+			}
+
+			return &csi.NodePublishVolumeResponse{}, nil
+		}
+
 		// mounter uses ext4 by default
 		options := volumeCapability.GetMount().GetMountFlags()
 		fsType := volumeCapability.GetMount().GetFsType()
@@ -229,6 +291,51 @@ func (ns *NodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+
+	logrus.Infof("NodeUnpublishVolume: unpublishing volume %v from targetPath %v", volumeID, targetPath)
+
+	existVol, err := ns.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if existVol == nil {
+		logrus.Warnf("NodeUnpublishVolume: volume not found: %v", volumeID)
+		return &csi.NodeUnpublishVolumeResponse{}, nil
+	}
+
+	if existVol.Frontend == string(types.VolumeFrontendISCSI) {
+		logrus.Infof("Detaching ISCSI volume %v at targetPath: %s", volumeID, targetPath)
+
+		util := &ISCSIUtil{}
+		diskUnmounter := getISCSIDiskUnmounter(req)
+		if err := util.DetachDisk(*diskUnmounter, targetPath); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		logrus.Infof("ISCSI detach and unmount complete for volume %v at targetPath: %s", volumeID, targetPath)
+
+		return &csi.NodeUnpublishVolumeResponse{}, nil
+	}
+
+	mounter := mount.New("")
+	for {
+		if err := mounter.Unmount(targetPath); err != nil {
+			if strings.Contains(err.Error(), "not mounted") ||
+				strings.Contains(err.Error(), "no mount point specified") {
+				break
+			}
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		notMnt, err := mounter.IsLikelyNotMountPoint(targetPath)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		if notMnt {
+			break
+		}
+		logrus.Debugf("There are multiple mount layers on mount point %v, will unmount all mount layers for this mount point", targetPath)
 	}
 
 	if err := cleanupMountPoint(targetPath, mount.New("")); err != nil {

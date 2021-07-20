@@ -46,6 +46,7 @@ require (
 	github.com/hashicorp/golang-lru v0.5.3 // indirect
 	github.com/imdario/mergo v0.3.8 // indirect
 	github.com/jinzhu/copier v0.0.0-20190924061706-b57f9002281a
+	github.com/kubernetes-csi/csi-lib-iscsi v0.0.0-20210519140452-fd47a25d3e16
 	github.com/kubernetes-csi/csi-lib-utils v0.6.1
 	github.com/longhorn/backing-image-manager v0.0.0-20210420131143-904cd772a7a9
 	github.com/longhorn/backupstore v0.0.0-20210504063753-dfee2468733e
@@ -54,7 +55,7 @@ require (
 	github.com/miekg/dns v1.1.22 // indirect
 	github.com/mitchellh/mapstructure v1.1.2
 	github.com/pkg/errors v0.9.1
-	github.com/prometheus/client_golang v1.2.1
+	github.com/prometheus/client_golang v0.9.4
 	github.com/rancher/go-rancher v0.1.1-0.20190307222549-9756097e5e4c
 	github.com/robfig/cron v1.2.0
 	github.com/satori/go.uuid v1.2.0
@@ -75,8 +76,9 @@ require (
 	k8s.io/apiextensions-apiserver v0.0.0
 	k8s.io/apimachinery v0.16.15
 	k8s.io/client-go v0.16.15
+	k8s.io/klog/v2 v2.9.0
 	k8s.io/kubernetes v1.16.15
 	k8s.io/metrics v0.16.15
-	k8s.io/utils v0.0.0-20190801114015-581e00157fb1
+	k8s.io/utils v0.0.0-20210527160623-6fdb442a123b
 	sigs.k8s.io/sig-storage-lib-external-provisioner v4.0.1+incompatible
 )
